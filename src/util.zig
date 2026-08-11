@@ -746,6 +746,14 @@ fn writePwd(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) void {
     };
 }
 
+/// Emit the color overrides as OSC 10/11/12.
+fn writeColorOverride(writer: *std.Io.Writer, code: u8, rgb: ?ghostty_vt.color.RGB) void {
+    const c = rgb orelse return;
+    writer.print("\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{ code, c.r, c.g, c.b }) catch |err| {
+        std.log.warn("failed to format dynamic color err={s}", .{@errorName(err)});
+    };
+}
+
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
@@ -759,6 +767,11 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
     }
+
+    // If state contains color override, restore it.
+    writeColorOverride(&builder.writer, 10, term.colors.foreground.override);
+    writeColorOverride(&builder.writer, 11, term.colors.background.override);
+    writeColorOverride(&builder.writer, 12, term.colors.cursor.override);
 
     const pages = &term.screens.active.pages;
     const screen_top = pages.getTopLeft(.screen);
@@ -1663,6 +1676,81 @@ test "serializeTerminal vt replays the pwd without a NUL sentinel" {
 
     try testing.expect(std.mem.indexOf(u8, output, "\x1b]7;file://myhost/private/tmp\x1b\\") != null);
     try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, output, 0));
+}
+
+test "serializeTerminalState restores dynamic colors set by the session" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    // A program (e.g. an editor applying its theme) sets the background.
+    stream.nextSlice("\x1b]11;rgb:2828/2828/3c3c\x1b\\");
+    stream.nextSlice("hello");
+
+    try testing.expect(term.colors.background.override != null);
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    // Background must be replayed so reattaching restores it.
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]11;rgb:28/28/3c\x1b\\") != null);
+    // Colors the session never set must not be imposed on the client.
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]10;") == null);
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]12;") == null);
+}
+
+test "serializeTerminalState restores the cursor style set by the session" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    // No DECSCUSR yet: the session's resolved default (a steady block) is sent
+    // concretely, so a shape left over in the attaching client cannot persist.
+    // DECSCUSR 0 would instead defer to that client and leave it stale.
+    {
+        const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+        defer alloc.free(output);
+        try testing.expect(std.mem.indexOf(u8, output, "\x1b[2 q") != null);
+        try testing.expect(std.mem.indexOf(u8, output, "\x1b[0 q") == null);
+    }
+
+    // A program selects a steady bar (DECSCUSR 6).
+    stream.nextSlice("\x1b[6 q");
+    stream.nextSlice("hello");
+    try testing.expectEqual(
+        ghostty_vt.Screen.CursorStyle.bar,
+        term.screens.active.cursor.cursor_style,
+    );
+
+    {
+        const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+        defer alloc.free(output);
+        try testing.expect(std.mem.indexOf(u8, output, "\x1b[6 q") != null);
+    }
+
+    // Blink is part of the shape: the same bar, blinking, is DECSCUSR 5.
+    stream.nextSlice("\x1b[5 q");
+    {
+        const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+        defer alloc.free(output);
+        try testing.expect(std.mem.indexOf(u8, output, "\x1b[5 q") != null);
+    }
 }
 
 fn testCreateTerminal(alloc: std.mem.Allocator, io: std.Io, cols: u16, rows: u16, vt_data: []const u8) !ghostty_vt.Terminal {

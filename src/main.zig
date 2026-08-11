@@ -1317,7 +1317,7 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon) !void {
             _ = cross.c.tcsetattr(lib_posix.STDIN_FILENO, cross.c.TCSAFLUSH, &orig_termios);
         }
         // Reset terminal modes on detach
-        const restore_seq = "\x1bc";
+        const restore_seq = "\x1bc\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\";
         _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
     }
 
